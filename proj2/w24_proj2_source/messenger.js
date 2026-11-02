@@ -46,10 +46,24 @@ class MessengerClient {
    *
    * Return Type: certificate object/dictionary
    */
+
+  /** 
+  long term-ElGamal key pair is made
+  returns a certificate that holds the public half. it is signed and other users use it ro find our public key 
+  **/
   async generateCertificate (username) {
-    throw ('not implemented!')
-    const certificate = {}
+
+    //both pub and sec are genereated from generateEG but only the public key i share
+    //the secret key always stays with this object
+    this.EGKeyPair = await generateEG()
+
+    //add our publick key
+    const certificate ={
+      username: username,
+      pub: this.EGKeyPair.pub
+    }
     return certificate
+
   }
 
   /**
@@ -61,11 +75,25 @@ class MessengerClient {
  *
  * Return Type: void
  */
+
+  /** 
+  check another users certificate and stores is so that we can messahe them
+  verification is done so that we know the certificate is valid and not tampered with
+  **/
   async receiveCertificate (certificate, signature) {
   // The signature will be on the output of stringifying the certificate
   // rather than on the certificate directly.
     const certString = JSON.stringify(certificate)
-    throw ('not implemented!')
+
+    //if valid then true else false
+    const valid = await verifyWithECDSA(this.caPublicKey, certString, signature)
+
+    //tampering deteccted then do not share the certificate and throw an error
+    if (!valid) {
+      throw 'certificate signature invalid, its possible the cert was tampered with'
+    }
+    //store it unchanged under the username, so sendmessage and receivemessage can use it to find the public key of the other user
+    this.certs[certificate.username] = certificate
   }
 
   /**
@@ -96,6 +124,17 @@ class MessengerClient {
   async receiveMessage (name, [header, ciphertext]) {
     throw ('not implemented!')
     return plaintext
+  }
+
+  //helper for sendMessage and receiveMessage; 
+  //Alice's secret with Bob's
+  //public key equals Bob's secret with Alice's public key.
+  async initialRootKey (name) {
+    if (this.certs[name] ===  undefined) {
+      throw 'certificate not found for' + name
+    }
+    //result is a hmac cryptokey, which is what hkdf expects as input
+    return await computeDH(this.EGKeyPair.sec, this.certs[name].pub)
   }
 };
 
