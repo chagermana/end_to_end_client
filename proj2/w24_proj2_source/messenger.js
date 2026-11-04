@@ -20,6 +20,8 @@ const {
   govEncryptionDataStr
 } = require('./lib')
 
+const MAX_SKIP = 1000 // most skipped message keys we will ever store
+
 /** ******* Implementation ********/
 
 class MessengerClient {
@@ -199,7 +201,7 @@ class MessengerClient {
    *
    * Rejects tampered, repeated or out-of-order messages.
    */
-  async receiveMessage (name, [header, ciphertext]) {
+    async receiveMessage (name, [header, ciphertext]) {
     // Ensure the sender has a verified certificate.
     if (!this.certs[name]) {
       throw new Error('Unknown sender: ' + name)
@@ -217,75 +219,104 @@ class MessengerClient {
       throw new Error('Invalid message header')
     }
 
-    // Detect whether the sender has changed their DH public key.
     const currentDH = state.DHr
       ? JSON.stringify(await cryptoKeyToJSON(state.DHr))
       : null
+    const incomingDH = JSON.stringify(await cryptoKeyToJSON(header.dh))
+    const headerString = JSON.stringify(header)
 
-    const incomingDH = JSON.stringify(
-      await cryptoKeyToJSON(header.dh)
-    )
+    // 1. Is this a message whose key we saved earlier?
+    const savedId = incomingDH + ':' + header.n
+    if (state.skipped[savedId]) {
+      const savedPlaintext = await decryptWithGCM(
+        state.skipped[savedId],
+        ciphertext,
+        header.receiverIV,
+        headerString
+      )
+      // Delete the key only after the message authenticated.
+      delete state.skipped[savedId]
+      return bufferToString(savedPlaintext)
+    }
 
+    // 2. Work on copies, so a forged message cannot damage our real state.
+    let rootKey = state.rootKey
+    let recvChainKey = state.recvChainKey
+    let Nr = state.Nr
+    let DHs = state.DHs
+    let sendChainKey = state.sendChainKey
+    let PN = state.PN
+    let Ns = state.Ns
+    const newSkipped = {}
+
+    // 3. Did the sender move to a new DH key?
     if (currentDH !== incomingDH) {
-      // We do not support skipped messages in the basic version.
-      if (state.DHr && header.pn !== state.Nr) {
-        throw new Error('Missing or out-of-order message')
+      if (state.DHr) {
+        // The sender's old chain must be at least as long as what we received.
+        if (header.pn < Nr) {
+          throw new Error('Invalid message header')
+        }
+        // Save the keys of old-chain messages that have not arrived yet.
+        const old = await this.skipMessageKeys(recvChainKey, Nr, header.pn)
+        for (const s of old.skipped) {
+          newSkipped[currentDH + ':' + s.n] = s.messageKey
+        }
       }
 
-      // Derive the receiving chain using the new DH public key.
-      const receiveResult = await this.advanceDHRatchet(
-        state.rootKey,
-        state.DHs.sec,
-        header.dh
-      )
+      // DH ratchet step for receiving.
+      const recv = await this.advanceDHRatchet(rootKey, DHs.sec, header.dh)
+      rootKey = recv.rootKey
+      recvChainKey = recv.chainKey
+      Nr = 0
 
-      state.rootKey = receiveResult.rootKey
-      state.recvChainKey = receiveResult.chainKey
-      state.DHr = header.dh
-      state.Nr = 0
-
-      // Begin a fresh sending ratchet for our next reply.
-      state.PN = state.Ns
-      state.Ns = 0
-      state.DHs = await generateEG()
-
-      const sendResult = await this.advanceDHRatchet(
-        state.rootKey,
-        state.DHs.sec,
-        state.DHr
-      )
-
-      state.rootKey = sendResult.rootKey
-      state.sendChainKey = sendResult.chainKey
+      // Start a fresh sending ratchet for our next reply.
+      PN = Ns
+      Ns = 0
+      DHs = await generateEG()
+      const send = await this.advanceDHRatchet(rootKey, DHs.sec, header.dh)
+      rootKey = send.rootKey
+      sendChainKey = send.chainKey
     }
 
-    // Without skipped-message support, counters must match.
-    if (header.n !== state.Nr) {
-      throw new Error('Repeated or out-of-order message')
+    // 4. Skip ahead in the current chain, saving keys of skipped messages.
+    if (header.n < Nr) {
+      throw new Error('Repeated message')
     }
-
-    if (!state.recvChainKey) {
+    if (!recvChainKey) {
       throw new Error('Receiving chain is not initialized')
     }
+    const skip = await this.skipMessageKeys(recvChainKey, Nr, header.n)
+    for (const s of skip.skipped) {
+      newSkipped[incomingDH + ':' + s.n] = s.messageKey
+    }
 
-    // Derive the exact message key expected for this message.
+    // Never store more than MAX_SKIP keys in total.
+    if (Object.keys(state.skipped).length +
+        Object.keys(newSkipped).length > MAX_SKIP) {
+      throw new Error('Too many skipped messages')
+    }
+
+    // 5. Derive this message's key and decrypt (this also checks the header).
     const { messageKey, nextChainKey } =
-      await this.advanceChain(state.recvChainKey)
-
-    // AES-GCM verifies both the ciphertext and the header.
-    // If either was modified, decryption throws an exception.
+      await this.advanceChain(skip.chainKey)
     const plaintextBuffer = await decryptWithGCM(
       messageKey,
       ciphertext,
       header.receiverIV,
-      JSON.stringify(header)
+      headerString
     )
 
-    // Only advance the receiving chain after authentication.
+    // 6. Authenticated: now it is safe to commit everything to state.
+    state.rootKey = rootKey
+    state.DHs = DHs
+    state.DHr = header.dh
+    state.sendChainKey = sendChainKey
+    state.PN = PN
+    state.Ns = Ns
     state.recvChainKey = nextChainKey
-    state.Nr += 1
+    state.Nr = header.n + 1
+    Object.assign(state.skipped, newSkipped)
 
-    // Convert the decrypted ArrayBuffer into a string.
     return bufferToString(plaintextBuffer)
   }
 
@@ -332,6 +363,26 @@ class MessengerClient {
       messageKey,
       nextChainKey
     }
+  }
+
+    /**
+   * Move a receiving chain forward from message number `from` up to (not
+   * including) `until`, saving the message key of each message we pass.
+   * Changes no state: it returns the new chain key and the saved keys,
+   * so the caller decides whether to keep them.
+   */
+  async skipMessageKeys (chainKey, from, until) {
+    if (until - from > MAX_SKIP) {
+      throw new Error('Too many skipped messages')
+    }
+    const skipped = []
+    let current = chainKey
+    for (let i = from; i < until; i++) {
+      const { messageKey, nextChainKey } = await this.advanceChain(current)
+      skipped.push({ n: i, messageKey })
+      current = nextChainKey
+    }
+    return { chainKey: current, skipped }
   }
 
   /**
@@ -396,7 +447,8 @@ class MessengerClient {
       recvChainKey: null,
       Ns: 0, // Messages sent in current sending chain
       Nr: 0, // Messages received in current receiving chain
-      PN: 0 // Length of previous sending chain
+      PN: 0,
+      skipped: {} // Length of previous sending chain
     }
 
     if (isSender) {
